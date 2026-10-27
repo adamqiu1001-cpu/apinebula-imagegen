@@ -1,0 +1,4 @@
+interface:
+  display_name: "APINebula 异步绘图"
+  short_description: "通过 APINebula 异步生成和修改图片，兼容 macOS 与 Windows"
+  default_prompt: "使用 $apinebula-imagegen 生成图片，保存任务编号并下载原图。"
