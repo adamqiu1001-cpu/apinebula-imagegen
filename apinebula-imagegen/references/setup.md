@@ -54,7 +54,9 @@ $skillDir = Join-Path $env:USERPROFILE '.agents\skills\apinebula-imagegen'
 
 ## 本地参考图：默认临时上传
 
-本地参考图默认上传至 tmpfiles.org，无需先选择上传方式或配置存储账户。脚本按其 API 文档设置 `expire=3600`（约一小时），删除由服务方执行；有效期内任何持有直链的人可读取，没有已核实的立即删除接口。在交付回复中说明实际上传、删除时效与直链可访问性，以及下载到本机的生成结果会保留。敏感个人信息仍需覆盖具体图片与服务的授权。
+本地参考图默认上传至 tmpfiles.org，无需先选择上传方式或配置存储账户。脚本按其 API 文档设置 `expire=3600`（约一小时），删除由服务方执行；有效期内任何持有直链的人可读取，没有已核实的立即删除接口。在交付回复中说明实际上传、删除时效与直链可访问性，以及下载到本机的生成结果会保留。
+
+授权证据复用、敏感图片的例外、审批说明模板及拒绝后的处理，以 [SKILL.md 的“新参考图如何上传”和“联网权限”](../SKILL.md) 为准。安装或自动选择 skill 本身不授予额外权限；明确的用户指令应如实带入审批，避免重复确认。
 
 ```text
 PYTHON SCRIPT submit --prompt-file "edit.txt" --out-dir "outputs/edit-v1" --image "reference.png"
