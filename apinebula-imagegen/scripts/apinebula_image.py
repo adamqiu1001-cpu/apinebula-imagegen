@@ -11,7 +11,10 @@ import subprocess
 import sys
 import uuid
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urljoin
+from html.parser import HTMLParser
+from contextlib import contextmanager
+from time import monotonic, sleep
 
 API = "https://apinebula.ai/v1/image-tasks"
 CONFIG = Path.home() / ".config" / "codex-imagegen"
@@ -202,42 +205,97 @@ def tmpfiles_direct_url(value):
     u = urlsplit(value)
     if (u.scheme not in ("http", "https") or u.netloc != "tmpfiles.org"
             or u.query or u.fragment
-            or not re.fullmatch(r"/(?:dl/)?[0-9]+(?:\.[A-Za-z0-9_-]+/[A-Za-z0-9_-]+)?/[A-Za-z0-9_.-]+", u.path)
+            or not re.fullmatch(r"/(?:dl/)?[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+/[A-Za-z0-9_-]+)?/[A-Za-z0-9_.-]+", u.path)
             or any(part in (".", "..") for part in u.path.split("/"))):
         raise UserError("Unexpected temporary upload URL")
-    path = u.path if u.path.startswith("/dl/") else "/dl" + u.path
+    path = u.path
+    # Numeric legacy pages have a deterministic /dl/ counterpart. New opaque
+    # page IDs require the download link actually served by the provider.
+    if not path.startswith("/dl/") and path.split("/")[1].isdigit():
+        path = "/dl" + path
     return "https://tmpfiles.org" + path
 
 
-def upload_tmpfiles(image, mime, ext, direct=False):
-    """Caller must have authorization for this image and third-party service."""
-    with session(direct) as s, image.open("rb") as f:
-        r = s.post("https://tmpfiles.org/api/v1/upload",
-                   files={"file": (uuid.uuid4().hex + ext, f, mime)},
-                   data={"expire": "3600"}, timeout=(15, 90), allow_redirects=False)
-        r.raise_for_status()
-        data = r.json()
-        if data.get("status") != "success":
-            raise UserError("Temporary upload failed; no image task submitted")
-        url = tmpfiles_direct_url(data.get("data", {}).get("url", ""))
-        # HTML preview pages can return HTTP 200. Verify the original bytes.
-        with s.get(url, stream=True, timeout=(15, 90), allow_redirects=False) as check:
+class DownloadLinks(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.links = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            self.links.extend(value for key, value in attrs if key == "href" and value)
+
+
+def verify_tmpfiles(client, value, image):
+    url = tmpfiles_direct_url(value)
+    identity = urlsplit(value).path.removeprefix("/dl/").strip("/").split("/")[-2:]
+    for attempt in range(2):
+        with client.get(url, stream=True, timeout=(15, 30), allow_redirects=False) as check:
             check.raise_for_status()
             if check.is_redirect:
                 raise UserError("Temporary reference redirected unexpectedly")
-            digest, total = hashlib.sha256(), 0
+            body = bytearray()
             for block in check.iter_content(65536):
-                total += len(block)
-                if total > MAX_IMAGE_BYTES:
+                body.extend(block)
+                if len(body) > MAX_IMAGE_BYTES:
                     raise UserError("Temporary reference exceeds the image limit")
-                digest.update(block)
-        if digest.digest() != hashlib.sha256(image.read_bytes()).digest():
-            raise UserError("Temporary URL does not return the original image; no image task submitted")
-    return url, {"provider": "tmpfiles", "expires_at": (datetime.now(timezone.utc)
-                 + timedelta(hours=1)).isoformat()}
+        if hashlib.sha256(body).digest() == hashlib.sha256(image.read_bytes()).digest():
+            return url
+        if attempt or len(body) > 1024 * 1024:
+            break
+        parser = DownloadLinks()
+        parser.feed(body.decode("utf-8", errors="replace"))
+        candidates = []
+        for link in parser.links:
+            try:
+                candidate = tmpfiles_direct_url(urljoin(url, link))
+            except (UserError, ValueError):
+                continue
+            parts = urlsplit(candidate).path.split("/")
+            if parts[1] == "dl" and parts[-2:] == identity:
+                candidates.append(candidate)
+        if not candidates:
+            break
+        url = candidates[0]
+    raise UserError("Temporary URL does not return the original image; no image task submitted")
+
+
+def upload_tmpfiles(image, mime, ext, direct=False, *, cached=None, checkpoint=None):
+    """Reuse a known upload page; verify its bytes before any generation POST."""
+    with session(direct) as s:
+        if cached:
+            value = cached["page"]
+            metadata = {"provider": "tmpfiles", "expires_at": cached["expires_at"]}
+            if datetime.fromisoformat(metadata["expires_at"]) <= datetime.now(timezone.utc):
+                raise UserError("Cached reference expired; no image task submitted")
+        else:
+            with image.open("rb") as f:
+                r = s.post("https://tmpfiles.org/api/v1/upload",
+                           files={"file": (uuid.uuid4().hex + ext, f, mime)},
+                           data={"expire": "3600"}, timeout=(15, 90), allow_redirects=False)
+            r.raise_for_status()
+            data = r.json()
+            if data.get("status") != "success":
+                raise UserError("Temporary upload failed; no image task submitted")
+            value = data.get("data", {}).get("url", "")
+            tmpfiles_direct_url(value)
+            metadata = {"provider": "tmpfiles", "expires_at": (datetime.now(timezone.utc)
+                        + timedelta(hours=1)).isoformat()}
+            if checkpoint:
+                checkpoint({"page": value, "expires_at": metadata["expires_at"]})
+        return verify_tmpfiles(s, value, image), metadata
 
 
 def submit(args):
+    # Validate the storage choice before reserving an output directory.
+    if getattr(args, "upload_provider", "tmpfiles") == "s3" and args.image:
+        storage()
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    with task_lock(args.out_dir):
+        submit_locked(args)
+
+
+def submit_locked(args):
     key = get_key()
     prompt = args.prompt_file.read_text(encoding="utf-8-sig").strip()
     if not prompt:
@@ -259,13 +317,25 @@ def submit(args):
     with path.open("x", encoding="utf-8") as f:
         json.dump(state, f)
     (args.out_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
+    recovery_path = args.out_dir / "resume.json"
+    recovery = {"quality": args.quality, "images": [str(p.resolve()) for p, _ in images],
+                "sha256": [hashlib.sha256(p.read_bytes()).hexdigest() for p, _ in images],
+                "cached": {}}
+    if images and provider == "tmpfiles" and not urls and not parent:
+        private_file(recovery_path, json.dumps(recovery))
     if parent:
         urls.append(parent_image_url(parent[1], key, args.direct))
     if images and provider == "tmpfiles":
         state["phase"] = "reference_uploading"
         save(path, state)
-        for image, (mime, ext) in images:
-            url, upload = upload_tmpfiles(image, mime, ext, args.direct)
+        for index, (image, (mime, ext)) in enumerate(images):
+            if recovery_path.exists():
+                def checkpoint(item, index=index):
+                    recovery["cached"][str(index)] = item
+                    private_file(recovery_path, json.dumps(recovery))
+                url, upload = upload_tmpfiles(image, mime, ext, args.direct, checkpoint=checkpoint)
+            else:
+                url, upload = upload_tmpfiles(image, mime, ext, args.direct)
             urls.append(url)
             state["uploads"].append(upload)
             save(path, state)
@@ -281,19 +351,72 @@ def submit(args):
             url = client.generate_presigned_url("get_object", Params={"Bucket": cfg["bucket"],
                                                "Key": object_key}, ExpiresIn=86400)
             urls.append(https_url(url))
-    payload = {"model": args.model, "prompt": prompt, "quality": args.quality,
+    submit_ready(path, state, prompt, args.quality, urls, key, args.direct)
+
+
+def submit_ready(path, state, prompt, quality, urls, key, direct):
+    payload = {"model": state["model"], "prompt": prompt, "quality": quality,
                "response_format": "url"}
     if urls:
         payload["images"] = [{"image_url": u} for u in urls]
     state["phase"] = "submission_outcome_unknown"
     save(path, state)
-    result = api_call("POST", "/edits" if urls else "/generations", key, args.direct, payload)
+    recovery = path.parent / "resume.json"
+    if recovery.exists():
+        recovery.unlink()
+    result = api_call("POST", "/edits" if urls else "/generations", key, direct, payload)
     task = result.get("task_id") or result.get("id")
     if not isinstance(task, str) or not re.fullmatch(r"task_[A-Za-z0-9_-]+", task):
         raise UserError("No valid task ID; keep state and check provider records before resubmitting")
     state.update(task_id=task, phase=result.get("status", "queued"))
     save(path, state)
     emit(task_id=task, status=state["phase"], state_file=str(path.resolve()))
+
+
+@contextmanager
+def task_lock(directory):
+    lock = directory / "resume.lock"
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        raise UserError("Submission or recovery already active or interrupted; check that no process is running before removing resume.lock") from None
+    os.close(fd)
+    try:
+        yield
+    finally:
+        lock.unlink()
+
+
+def resume(args):
+    with task_lock(args.state.parent):
+        resume_locked(args)
+
+
+def resume_locked(args):
+    state = json.loads(args.state.read_text(encoding="utf-8"))
+    if state.get("task_id") or state.get("phase") not in ("preparing", "reference_uploading"):
+        raise UserError("Resume is only for confirmed pre-submission failures; use status for saved tasks")
+    recovery_path = args.state.parent / "resume.json"
+    if not recovery_path.exists():
+        raise UserError("No resumable local-reference checkpoint; retain state and inspect the original failure")
+    recovery = json.loads(recovery_path.read_text(encoding="utf-8"))
+    images = [Path(p) for p in recovery["images"]]
+    if [hashlib.sha256(p.read_bytes()).hexdigest() for p in images] != recovery["sha256"]:
+        raise UserError("Reference image changed since original submission")
+    urls, uploads = [], []
+    for index, image in enumerate(images):
+        mime, ext = inspect_image(image)[0]
+        def checkpoint(item, index=index):
+            recovery["cached"][str(index)] = item
+            private_file(recovery_path, json.dumps(recovery))
+        url, metadata = upload_tmpfiles(image, mime, ext, args.direct,
+                                      cached=recovery["cached"].get(str(index)), checkpoint=checkpoint)
+        urls.append(url)
+        uploads.append(metadata)
+    state["uploads"] = uploads
+    save(args.state, state)
+    prompt = (args.state.parent / "prompt.txt").read_text(encoding="utf-8")
+    submit_ready(args.state, state, prompt, recovery["quality"], urls, get_key(), args.direct)
 
 
 def download(url, directory, direct=False):
@@ -334,11 +457,18 @@ def download(url, directory, direct=False):
     return output, size
 
 
-def status(args):
+def status_once(args):
     state = json.loads(args.state.read_text(encoding="utf-8"))
     task = state.get("task_id", "")
     if not re.fullmatch(r"task_[A-Za-z0-9_-]+", task):
         raise UserError("No task ID saved; inspect provider task/usage records, do not resubmit blindly")
+    if state.get("phase") == "completed" and state.get("output"):
+        existing = args.state.parent / state["output"]
+        if existing.exists():
+            inspect_image(existing)
+            remember_result(args.state, state)
+            emit(status="completed", image=str(existing.resolve()), size=state.get("size"))
+            return "completed"
     result = api_call("GET", "/" + task + "?detail=true", get_key(), args.direct)
     state["phase"] = result.get("status", "unknown")
     save(args.state, state)
@@ -348,7 +478,7 @@ def status(args):
             if existing.exists():
                 remember_result(args.state, state)
                 emit(status="completed", image=str(existing.resolve()), size=state.get("size"))
-                return
+                return "completed"
         items = result.get("detail", {}).get("data", [])
         if len(items) != 1 or not items[0].get("download_url"):
             raise UserError("Completed task lacks one download URL; retain ID and query again")
@@ -361,6 +491,22 @@ def status(args):
         emit(status="failed", task_id=task, message="Provider reported failure; check its task details. No new request submitted.")
     else:
         emit(status=state["phase"], task_id=task)
+
+    return state["phase"]
+
+
+def status(args):
+    wait = getattr(args, "wait", 0)
+    interval = getattr(args, "interval", 10)
+    if not 0 <= wait <= 50 or not 5 <= interval <= 30:
+        raise UserError("Use --wait 0..50 seconds and --interval 5..30 seconds")
+    deadline = monotonic() + wait
+    while True:
+        phase = status_once(args)
+        remaining = deadline - monotonic()
+        if phase in ("completed", "failed") or remaining <= 0:
+            return
+        sleep(min(interval, remaining))
 
 
 def cleanup(args):
@@ -412,7 +558,7 @@ def configure_storage():
     emit(configured=True, file=str(STORAGE_FILE))
 
 
-def main():
+def main_with_args(argv=None):
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
     p = argparse.ArgumentParser(description=__doc__)
@@ -433,11 +579,14 @@ def main():
     previous.add_argument("--from-state", type=Path)
     s.add_argument("--session-file", type=Path)
     s.add_argument("--direct", action="store_true")
-    for name in ("status", "cleanup"):
+    for name in ("status", "cleanup", "resume"):
         s = sub.add_parser(name)
         s.add_argument("--state", type=Path, required=True)
         s.add_argument("--direct", action="store_true")
-    args = p.parse_args()
+        if name == "status":
+            s.add_argument("--wait", type=int, default=0, help="Poll for up to 50 seconds; never resubmits")
+            s.add_argument("--interval", type=int, default=10)
+    args = p.parse_args(argv)
     try:
         if args.command == "configure-key":
             configure_key()
@@ -454,6 +603,10 @@ def main():
         # Network exceptions may embed signed URLs. Report only the class.
         emit(error=type(exc).__name__, message="Operation interrupted. Keep state.json; use status for saved tasks. Check local setup/network; do not blindly submit again.")
         return 1
+
+
+def main():
+    return main_with_args()
 
 
 if __name__ == "__main__":

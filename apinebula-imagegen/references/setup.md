@@ -60,7 +60,7 @@ $skillDir = Join-Path $env:USERPROFILE '.agents\skills\apinebula-imagegen'
 PYTHON SCRIPT submit --prompt-file "edit.txt" --out-dir "outputs/edit-v1" --image "reference.png"
 ```
 
-脚本随机化上传文件名，识别网页地址与已经是直链的地址，下载核验原图字节后才提交编辑任务。不发送 APINebula Key 给图床，不在任务状态中记录临时链接。失败时保留状态，不自动切换服务或重复付费提交。
+脚本随机化上传文件名，识别网页地址与已经是直链的地址，下载核验原图字节后才提交编辑任务。不发送 APINebula Key 给图床，不在任务状态中记录临时直链。新版展示页通过其实际下载链接解析；原图字节校验成功才提交。失败时保留状态，支持符合条件的 `resume`，不自动切换服务或重复付费提交。
 
 ## 连续修改，不必再次附图
 
@@ -89,6 +89,10 @@ Windows：
 ```
 
 本地图片在 `submit` 后加 `--image "图片绝对路径"`（默认 tmpfiles.org，一小时到期；私有存储加 `--upload-provider s3`）；在线图片加 `--image-url "https://..."`。两者均可重复传入，全部使用异步编辑接口。每次新生成用新目录；查询同一任务则继续使用原 state.json。
+
+`status --state ".../state.json" --wait 40 --interval 10` 可在一次调用内每十秒查询，完成即下载，等待窗口最多 50 秒；网络请求另有超时。重复读取已下载结果走本机缓存。
+
+`resume --state ".../state.json"` 可恢复新版脚本在本地 tmpfiles 上传阶段的中断，复用原上传，不支持已发出或结果未知的生成请求；详见 SKILL.md。权限受限的 `resume.json` 临时保存恢复所需展示页，发出生成请求前删除，不包含 API 密钥，不要分享它。
 
 `status` 完成时自动下载真实格式的 `image.png`、`image.jpg` 或 `image.webp`，返回实际尺寸。`cleanup --state ".../state.json"` 只删除该状态文件记录的、已终止任务的 S3 参考图对象，不删除生成图片。对 tmpfiles 只提示自动到期，不伪报立即删除。
 

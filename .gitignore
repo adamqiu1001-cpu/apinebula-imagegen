@@ -30,3 +30,8 @@ CLAUDE.local.md
 .claude/settings.local.json
 build/
 dist/
+
+# Private upload recovery and per-chat selections
+resume.json
+resume.lock
+.apinebula/
