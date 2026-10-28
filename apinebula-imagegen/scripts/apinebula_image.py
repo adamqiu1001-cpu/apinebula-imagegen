@@ -2,6 +2,7 @@
 """APINebula async image CLI. Python 3.10+, macOS and Windows."""
 import argparse
 import getpass
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -9,6 +10,7 @@ import re
 import subprocess
 import sys
 import uuid
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit
 
 API = "https://apinebula.ai/v1/image-tasks"
@@ -140,6 +142,101 @@ def inspect_image(path):
     return allowed[fmt], size
 
 
+def session_path(explicit=None):
+    """Scope selection to this chat, never the newest file across workspaces."""
+    if explicit:
+        return Path(explicit).resolve()
+    thread = os.environ.get("CODEX_THREAD_ID")
+    if not thread:
+        return None
+    name = hashlib.sha256(thread.encode("utf-8")).hexdigest()[:24]
+    return Path.cwd() / ".apinebula" / "sessions" / (name + ".json")
+
+
+def remember_result(path, state):
+    selected = state.get("session_file")
+    if not selected:
+        return
+    if not state.get("completed_at"):
+        state["completed_at"] = datetime.now(timezone.utc).isoformat()
+        save(path, state)
+    target = Path(selected)
+    old = json.loads(target.read_text(encoding="utf-8")) if target.exists() else {}
+    if old.get("completed_at", "") > state["completed_at"]:
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    save(target, {"latest_state": str(path.resolve()), "completed_at": state["completed_at"]})
+
+
+def parent_state(args, selected):
+    previous = getattr(args, "from_state", None)
+    continuing = getattr(args, "continue_latest", False)
+    if previous and continuing:
+        raise UserError("Choose --continue or --from-state")
+    if (previous or continuing) and (args.image or args.image_url):
+        raise UserError("Choose an explicit reference or a previous task, not both")
+    if continuing:
+        if not selected or not selected.exists():
+            raise UserError("No completed image selected in this chat; use --from-state for its known task")
+        previous = json.loads(selected.read_text(encoding="utf-8")).get("latest_state")
+        if not previous:
+            raise UserError("This chat has no latest completed task")
+    if not previous:
+        return None
+    path = Path(previous).resolve()
+    state = json.loads(path.read_text(encoding="utf-8"))
+    if state.get("phase") != "completed" or not re.fullmatch(r"task_[A-Za-z0-9_-]+", state.get("task_id", "")):
+        raise UserError("The selected parent task is not completed")
+    return path, state
+
+
+def parent_image_url(state, key, direct):
+    result = api_call("GET", "/" + state["task_id"] + "?detail=true", key, direct)
+    items = result.get("detail", {}).get("data", [])
+    if result.get("status") != "completed" or len(items) != 1 or not items[0].get("download_url"):
+        raise UserError("Parent download URL unavailable; keep its local image and do not silently start a text-only generation")
+    return https_url(items[0]["download_url"])
+
+
+def tmpfiles_direct_url(value):
+    u = urlsplit(value)
+    if (u.scheme not in ("http", "https") or u.netloc != "tmpfiles.org"
+            or u.query or u.fragment
+            or not re.fullmatch(r"/(?:dl/)?[0-9]+(?:\.[A-Za-z0-9_-]+/[A-Za-z0-9_-]+)?/[A-Za-z0-9_.-]+", u.path)
+            or any(part in (".", "..") for part in u.path.split("/"))):
+        raise UserError("Unexpected temporary upload URL")
+    path = u.path if u.path.startswith("/dl/") else "/dl" + u.path
+    return "https://tmpfiles.org" + path
+
+
+def upload_tmpfiles(image, mime, ext, direct=False):
+    """Caller must have authorization for this image and third-party service."""
+    with session(direct) as s, image.open("rb") as f:
+        r = s.post("https://tmpfiles.org/api/v1/upload",
+                   files={"file": (uuid.uuid4().hex + ext, f, mime)},
+                   data={"expire": "3600"}, timeout=(15, 90), allow_redirects=False)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("status") != "success":
+            raise UserError("Temporary upload failed; no image task submitted")
+        url = tmpfiles_direct_url(data.get("data", {}).get("url", ""))
+        # HTML preview pages can return HTTP 200. Verify the original bytes.
+        with s.get(url, stream=True, timeout=(15, 90), allow_redirects=False) as check:
+            check.raise_for_status()
+            if check.is_redirect:
+                raise UserError("Temporary reference redirected unexpectedly")
+            digest, total = hashlib.sha256(), 0
+            for block in check.iter_content(65536):
+                total += len(block)
+                if total > MAX_IMAGE_BYTES:
+                    raise UserError("Temporary reference exceeds the image limit")
+                digest.update(block)
+        if digest.digest() != hashlib.sha256(image.read_bytes()).digest():
+            raise UserError("Temporary URL does not return the original image; no image task submitted")
+    return url, {"provider": "tmpfiles", "expires_at": (datetime.now(timezone.utc)
+                 + timedelta(hours=1)).isoformat()}
+
+
 def submit(args):
     key = get_key()
     prompt = args.prompt_file.read_text(encoding="utf-8-sig").strip()
@@ -147,15 +244,32 @@ def submit(args):
         raise UserError("Prompt file is empty")
     urls = [https_url(u) for u in args.image_url]
     images = [(p, inspect_image(p)[0]) for p in args.image]
-    cfg = storage() if images else None
+    provider = getattr(args, "upload_provider", "tmpfiles")
+    cfg = storage() if images and provider == "s3" else None
+    selected = session_path(getattr(args, "session_file", None))
+    parent = parent_state(args, selected)
     args.out_dir.mkdir(parents=True, exist_ok=True)
     path = args.out_dir / "state.json"
-    state = {"version": 1, "phase": "preparing", "model": args.model, "uploads": []}
+    state = {"version": 2, "phase": "preparing", "model": args.model, "uploads": []}
+    if selected:
+        state["session_file"] = str(selected.resolve())
+    if parent:
+        state["parent_state"] = str(parent[0])
     # Reservation remains after an uncertain failure, preventing duplicate billing.
     with path.open("x", encoding="utf-8") as f:
         json.dump(state, f)
     (args.out_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
-    if images:
+    if parent:
+        urls.append(parent_image_url(parent[1], key, args.direct))
+    if images and provider == "tmpfiles":
+        state["phase"] = "reference_uploading"
+        save(path, state)
+        for image, (mime, ext) in images:
+            url, upload = upload_tmpfiles(image, mime, ext, args.direct)
+            urls.append(url)
+            state["uploads"].append(upload)
+            save(path, state)
+    elif images:
         client = storage_client(cfg, args.direct)
         for image, (mime, ext) in images:
             object_key = "codex-image-reference/" + uuid.uuid4().hex + ext
@@ -232,6 +346,7 @@ def status(args):
         if state.get("output"):
             existing = args.state.parent / state["output"]
             if existing.exists():
+                remember_result(args.state, state)
                 emit(status="completed", image=str(existing.resolve()), size=state.get("size"))
                 return
         items = result.get("detail", {}).get("data", [])
@@ -240,6 +355,7 @@ def status(args):
         output, size = download(items[0]["download_url"], args.state.parent, args.direct)
         state.update(output=output.name, size=list(size))
         save(args.state, state)
+        remember_result(args.state, state)
         emit(status="completed", image=str(output.resolve()), size=size)
     elif state["phase"] == "failed":
         emit(status="failed", task_id=task, message="Provider reported failure; check its task details. No new request submitted.")
@@ -255,18 +371,25 @@ def cleanup(args):
     if not uploads:
         emit(deleted=0)
         return
+    temporary = [u for u in uploads if u.get("provider") == "tmpfiles"]
+    private = [u for u in uploads if u.get("provider", "s3") == "s3"]
+    if len(temporary) + len(private) != len(uploads):
+        raise UserError("Unknown upload provider in state")
+    if not private:
+        emit(deleted=0, temporary_references=len(temporary), message="Temporary files expire automatically; no immediate-delete API is available")
+        return
     cfg = storage()
-    for item in uploads:
+    for item in private:
         if (item["endpoint"], item["bucket"]) != (cfg["endpoint"], cfg["bucket"]):
             raise UserError("Storage configuration differs from this task; clean up in the original bucket")
         if not re.fullmatch(r"codex-image-reference/[0-9a-f]{32}\.(png|jpg|webp)", item["key"]):
             raise UserError("Unexpected object key in state")
     client = storage_client(cfg, args.direct)
-    for item in uploads:
+    for item in private:
         client.delete_object(Bucket=item["bucket"], Key=item["key"])
-    state["uploads"] = []
+    state["uploads"] = temporary
     save(args.state, state)
-    emit(deleted=len(uploads))
+    emit(deleted=len(private), temporary_references=len(temporary))
 
 
 def configure_key():
@@ -303,6 +426,12 @@ def main():
     s.add_argument("--quality", choices=["low", "medium", "high", "auto"], default="high")
     s.add_argument("--image", type=Path, action="append", default=[])
     s.add_argument("--image-url", action="append", default=[])
+    s.add_argument("--upload-provider", choices=["s3", "tmpfiles"], default="tmpfiles",
+                   help="Local reference upload service (default: tmpfiles, expires after 1 hour)")
+    previous = s.add_mutually_exclusive_group()
+    previous.add_argument("--continue", dest="continue_latest", action="store_true")
+    previous.add_argument("--from-state", type=Path)
+    s.add_argument("--session-file", type=Path)
     s.add_argument("--direct", action="store_true")
     for name in ("status", "cleanup"):
         s = sub.add_parser(name)
