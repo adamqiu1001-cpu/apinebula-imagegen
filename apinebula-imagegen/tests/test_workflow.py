@@ -16,7 +16,7 @@ m = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(m)
 
 
-class WorkflowTests(unittest.TestCase):
+class WorkflowCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="nebula 中文 空格 ")
         self.addCleanup(self.tmp.cleanup)
@@ -24,7 +24,7 @@ class WorkflowTests(unittest.TestCase):
         self.prompt = self.root / "提示词.txt"
         self.prompt.write_text("雨夜城市", encoding="utf-8")
         self.args = argparse.Namespace(prompt_file=self.prompt, out_dir=self.root / "输出", image=[],
-                                       image_url=[], model="gpt-image-2.5", quality="high", direct=False)
+                                       image_url=[], model="gpt-image-2.5", quality="high", direct=False, session_file=self.root / "session.json")
         self.key = patch.object(m, "get_key", return_value="test-key-never-log")
         self.key.start()
         self.addCleanup(self.key.stop)
@@ -37,6 +37,8 @@ class WorkflowTests(unittest.TestCase):
     def state_args(self):
         return argparse.Namespace(state=self.args.out_dir / "state.json", direct=False)
 
+
+class WorkflowTests(WorkflowCase):
     def test_text_submission_and_duplicate_guard(self):
         call = self.create()
         self.assertEqual(call.call_args.args[1], "/generations")
@@ -194,6 +196,170 @@ class WorkflowTests(unittest.TestCase):
             m.cleanup(args)
         client.delete_object.assert_called_once()
         self.assertEqual(json.loads(args.state.read_text())["uploads"], [])
+
+
+class ContinuationTests(WorkflowCase):
+    def completed_parent(self):
+        self.create()
+        output = self.args.out_dir / "image.png"
+        Image.new("RGB", (20, 20), "blue").save(output)
+        state = json.loads(self.state_args().state.read_text())
+        state.update(phase="completed", output="image.png", size=[20, 20])
+        m.save(self.state_args().state, state)
+        return self.state_args().state
+
+    def test_continue_reuses_parent_url_without_local_upload(self):
+        parent = self.completed_parent()
+        self.args.from_state = parent
+        self.args.out_dir = self.root / "second"
+        requests = []
+        def api(method, endpoint, key, direct=False, payload=None):
+            requests.append((method, endpoint, payload))
+            if method == "GET":
+                return {"status": "completed", "detail": {"data": [{"download_url": "https://cdn.example.com/fresh.png?token=private"}]}}
+            return {"id": "task_second", "status": "queued"}
+        with patch.object(m, "api_call", side_effect=api):
+            m.submit(self.args)
+        self.assertEqual([x[0] for x in requests], ["GET", "POST"])
+        self.assertEqual(requests[-1][1], "/edits")
+        self.assertEqual(requests[-1][2]["images"], [{"image_url": "https://cdn.example.com/fresh.png?token=private"}])
+        state = json.loads((self.args.out_dir / "state.json").read_text())
+        self.assertEqual(Path(state["parent_state"]), parent.resolve())
+        self.assertNotIn("token=private", json.dumps(state))
+
+    def test_only_downloaded_success_becomes_latest(self):
+        self.create()
+        sessionfile = self.args.session_file
+        self.assertFalse(sessionfile.exists())
+        output = self.args.out_dir / "image.png"
+        def downloaded(*args):
+            Image.new("RGB", (20, 20)).save(output)
+            return output, (20, 20)
+        response = {"status": "completed", "detail": {"data": [{"download_url": "https://cdn.example.com/out.png"}]}}
+        with patch.object(m, "api_call", return_value=response), patch.object(m, "download", side_effect=downloaded):
+            m.status(self.state_args())
+        selected = json.loads(sessionfile.read_text())
+        self.assertEqual(Path(selected["latest_state"]), self.state_args().state.resolve())
+        self.args.out_dir = self.root / "failed-later"
+        self.create({"id": "task_failed", "status": "queued"})
+        with patch.object(m, "api_call", return_value={"status": "failed"}):
+            m.status(self.state_args())
+        self.assertEqual(json.loads(sessionfile.read_text()), selected)
+
+    def test_continue_uses_session_selection_and_fails_if_missing(self):
+        self.args.continue_latest = True
+        with self.assertRaises(m.UserError), patch.object(m, "api_call") as api:
+            m.submit(self.args)
+        api.assert_not_called()
+        self.args.continue_latest = False
+        parent = self.completed_parent()
+        self.args.continue_latest = True
+        m.save(self.args.session_file, {"latest_state": str(parent.resolve())})
+        self.args.out_dir = self.root / "continued"
+        def api(method, endpoint, key, direct=False, payload=None):
+            if method == "GET":
+                return {"status": "completed", "detail": {"data": [{"download_url": "https://cdn.example.com/current.png"}]}}
+            return {"id": "task_continued", "status": "queued"}
+        with patch.object(m, "api_call", side_effect=api):
+            m.submit(self.args)
+        self.assertEqual(json.loads((self.args.out_dir / "state.json").read_text())["parent_state"], str(parent.resolve()))
+
+    def test_chat_sessions_do_not_share_latest(self):
+        with patch.dict(m.os.environ, {"CODEX_THREAD_ID": "chat-a"}):
+            a = m.session_path()
+        with patch.dict(m.os.environ, {"CODEX_THREAD_ID": "chat-b"}):
+            b = m.session_path()
+        self.assertNotEqual(a, b)
+        with patch.dict(m.os.environ, {}, clear=True):
+            self.assertIsNone(m.session_path())
+
+    def test_duplicate_continuation_stops_before_network(self):
+        parent = self.completed_parent()
+        self.args.from_state = parent
+        with patch.object(m, "api_call") as api, self.assertRaises(FileExistsError):
+            m.submit(self.args)
+        api.assert_not_called()
+
+    def test_rechecking_older_success_does_not_replace_newer_selection(self):
+        parent = self.completed_parent()
+        state = json.loads(parent.read_text())
+        state["completed_at"] = "2026-10-27T10:00:00+00:00"
+        m.save(parent, state)
+        selection = {"latest_state": str(self.root / "newer/state.json"), "completed_at": "2026-10-27T11:00:00+00:00"}
+        m.save(self.args.session_file, selection)
+        m.remember_result(parent, state)
+        self.assertEqual(json.loads(self.args.session_file.read_text()), selection)
+
+    def test_unavailable_parent_does_not_submit_paid_request(self):
+        parent = self.completed_parent()
+        self.args.from_state = parent
+        self.args.out_dir = self.root / "retry-edit"
+        with patch.object(m, "api_call", return_value={"status": "completed", "detail": {"data": []}}) as api:
+            with self.assertRaises(m.UserError):
+                m.submit(self.args)
+        self.assertEqual([c.args[0] for c in api.call_args_list], ["GET"])
+
+
+class TemporaryUploadTests(WorkflowCase):
+    def run_upload(self, body=None):
+        image = self.root / "ref.png"
+        Image.new("RGB", (8, 8), "blue").save(image)
+        uploaded, checked, client = MagicMock(), MagicMock(), MagicMock()
+        uploaded.json.return_value = {"status": "success", "data": {"url": "https://tmpfiles.org/dl/42/ref.png"}}
+        checked.is_redirect = False
+        checked.iter_content.return_value = [image.read_bytes() if body is None else body]
+        checked.__enter__.return_value = checked
+        client.post.return_value = uploaded
+        client.get.return_value = checked
+        with patch.object(m, "session") as factory:
+            factory.return_value.__enter__.return_value = client
+            result = m.upload_tmpfiles(image, "image/png", ".png")
+        return result, client
+
+    def test_temporary_reference_verifies_bytes_and_sets_expiry_without_auth(self):
+        (url, metadata), client = self.run_upload()
+        self.assertEqual(url, "https://tmpfiles.org/dl/42/ref.png")
+        self.assertEqual(metadata["provider"], "tmpfiles")
+        from datetime import datetime, timezone
+        remaining = (datetime.fromisoformat(metadata["expires_at"]) - datetime.now(timezone.utc)).total_seconds()
+        self.assertTrue(3500 < remaining <= 3600)
+        self.assertEqual(client.post.call_args.kwargs["data"], {"expire": "3600"})
+        self.assertNotIn("headers", client.post.call_args.kwargs)
+        self.assertNotIn("headers", client.get.call_args.kwargs)
+        self.assertNotIn("url", metadata)
+
+    def test_html_preview_never_becomes_reference(self):
+        with self.assertRaises(m.UserError):
+            self.run_upload(b"<html>Preview, not original image</html>")
+
+    def test_tmpfiles_upload_is_opt_in_and_keeps_s3_default(self):
+        image = self.root / "ref.png"
+        Image.new("RGB", (8, 8), "blue").save(image)
+        self.args.image = [image]
+        self.args.upload_provider = "tmpfiles"
+        with patch.object(m, "upload_tmpfiles", return_value=("https://tmpfiles.org/dl/42/ref.png", {"provider": "tmpfiles", "expires_at": "2026-10-27T12:00:00+00:00"}), create=True):
+            call = self.create()
+        self.assertEqual(call.call_args.args[4]["images"], [{"image_url": "https://tmpfiles.org/dl/42/ref.png"}])
+        state = json.loads(self.state_args().state.read_text())
+        self.assertEqual(state["uploads"][0]["provider"], "tmpfiles")
+
+    def test_tmpfiles_response_must_point_to_provider(self):
+        for bad in ("https://evil.example/42/ref.png", "https://user:secret@tmpfiles.org/42/ref.png", "https://tmpfiles.org/", "https://tmpfiles.org/42/ref.png?secret=x"):
+            with self.subTest(url=bad), self.assertRaises(m.UserError):
+                m.tmpfiles_direct_url(bad)
+        self.assertEqual(m.tmpfiles_direct_url("http://tmpfiles.org/42/ref.png"), "https://tmpfiles.org/dl/42/ref.png")
+        self.assertEqual(m.tmpfiles_direct_url("https://tmpfiles.org/dl/1793100000.sigN_12/token12/ref.png"), "https://tmpfiles.org/dl/1793100000.sigN_12/token12/ref.png")
+        self.assertEqual(m.tmpfiles_direct_url("https://tmpfiles.org/dl/42/ref.png"), "https://tmpfiles.org/dl/42/ref.png")
+
+    def test_upload_failure_never_submits_paid_task(self):
+        image = self.root / "ref.png"
+        Image.new("RGB", (8, 8), "blue").save(image)
+        self.args.image = [image]
+        self.args.upload_provider = "tmpfiles"
+        with patch.object(m, "upload_tmpfiles", side_effect=m.UserError("Upload failed"), create=True), patch.object(m, "api_call") as api:
+            with self.assertRaises(m.UserError):
+                m.submit(self.args)
+        api.assert_not_called()
 
 
 if __name__ == "__main__":

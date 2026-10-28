@@ -30,3 +30,11 @@ CLAUDE.local.md
 .claude/settings.local.json
 build/
 dist/
+
+# Reproducible native packaging caches and generated user files
+.build/
+outputs/
+.apinebula/
+runtime/
+*.part
+*.zip
