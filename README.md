@@ -23,6 +23,7 @@ GitHub 的 **Code → Download ZIP 是源码，不是成品免安装包**。如�
 - [维护者：macOS 打包](docs/build-macos.md)
 - [维护者：Windows 打包](docs/build-windows.md)
 - [命令行参考](docs/cli.md)
+- [维护者：直接上传 GitHub](docs/github-upload.md)：首次登录、Mac/Windows 安装、日常推送与权限排错，无需网页逐个上传。
 - [实际验证范围](验证记录.md)
 
 临时图床需要用户对图片和服务的授权：约一小时自动到期，持有直链者可访问。也可用自己的私有 S3 存储。继续修改已生成图片通常直接复用 APINebula 原任务链接，不需要图床或重新上传。实际出图按服务商计费。
