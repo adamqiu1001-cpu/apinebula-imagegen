@@ -1,5 +1,6 @@
 """Offline tests: no paid generation, private storage or real keys required."""
 import argparse
+import contextlib
 import importlib.util
 import io
 import json
@@ -368,6 +369,153 @@ class TemporaryUploadTests(WorkflowCase):
                 m.submit(self.args)
         api.assert_not_called()
 
+
+class RecoveryAndPollingTests(WorkflowCase):
+    def response(self, body, content_type="image/png"):
+        response = MagicMock()
+        response.is_redirect = False
+        response.headers = {"Content-Type": content_type}
+        response.iter_content.return_value = [body]
+        response.__enter__.return_value = response
+        return response
+
+    def test_new_upload_page_resolves_only_matching_download_then_verifies_bytes(self):
+        image = self.root / "ref.png"
+        Image.new("RGB", (8, 8), "blue").save(image)
+        page_url = "https://tmpfiles.org/wSAhLDz8mOim/ref.png"
+        direct_url = "https://tmpfiles.org/dl/1793167578.signature/wSAhLDz8mOim/ref.png"
+        page = b'<a href="https://evil.example/dl/file">ad</a><a href="https://tmpfiles.org/dl/1793167578.signature/wSAhLDz8mOim/ref.png">Download</a>'
+        uploaded = MagicMock()
+        uploaded.json.return_value = {"status": "success", "data": {"url": page_url}}
+        client = MagicMock()
+        client.post.return_value = uploaded
+        client.get.side_effect = [self.response(page, "text/html"), self.response(image.read_bytes())]
+        with patch.object(m, "session") as factory:
+            factory.return_value.__enter__.return_value = client
+            url, metadata = m.upload_tmpfiles(image, "image/png", ".png")
+        self.assertEqual(url, direct_url)
+        self.assertEqual([c.args[0] for c in client.get.call_args_list], [page_url, direct_url])
+        self.assertEqual(client.post.call_count, 1)
+        self.assertEqual(metadata["provider"], "tmpfiles")
+
+    def test_alphanumeric_page_url_is_not_guessed_as_direct_url(self):
+        self.assertEqual(m.tmpfiles_direct_url("https://tmpfiles.org/wSAhLDz8mOim/ref.png"),
+                         "https://tmpfiles.org/wSAhLDz8mOim/ref.png")
+
+    def test_resume_reuses_uploaded_page_and_never_reuploads_after_verification_failure(self):
+        image = self.root / "ref.png"
+        Image.new("RGB", (8, 8), "blue").save(image)
+        self.args.image = [image]
+        page_url = "https://tmpfiles.org/wSAhLDz8mOim/ref.png"
+        direct_url = "https://tmpfiles.org/dl/1793167578.signature/wSAhLDz8mOim/ref.png"
+        uploaded = MagicMock()
+        uploaded.json.return_value = {"status": "success", "data": {"url": page_url}}
+        client = MagicMock()
+        client.post.return_value = uploaded
+        client.get.side_effect = ConnectionError("interrupted after upload")
+        with patch.object(m, "session") as factory, patch.object(m, "api_call") as api:
+            factory.return_value.__enter__.return_value = client
+            with self.assertRaises(ConnectionError):
+                m.submit(self.args)
+            api.assert_not_called()
+        client.get.side_effect = [self.response(b'<a href="' + direct_url.encode() + b'">Download</a>', "text/html"),
+                                  self.response(image.read_bytes())]
+        with patch.object(m, "session") as factory, patch.object(m, "api_call", return_value={"id": "task_resumed", "status": "queued"}) as api:
+            factory.return_value.__enter__.return_value = client
+            self.assertEqual(m.main_with_args(["resume", "--state", str(self.state_args().state)]), 0)
+        self.assertEqual(client.post.call_count, 1)
+        self.assertEqual(api.call_count, 1)
+        self.assertEqual(api.call_args.args[4]["images"], [{"image_url": direct_url}])
+        state = json.loads(self.state_args().state.read_text())
+        self.assertEqual(state["task_id"], "task_resumed")
+        self.assertNotIn(page_url, self.state_args().state.read_text())
+        self.assertNotIn(direct_url, self.state_args().state.read_text())
+        self.assertFalse((self.args.out_dir / "resume.json").exists())
+
+    def test_resume_refuses_uncertain_or_submitted_task_before_any_network(self):
+        self.create()
+        for phase, task in (("submission_outcome_unknown", None), ("queued", "task_test")):
+            state = json.loads(self.state_args().state.read_text())
+            state["phase"] = phase
+            state.pop("task_id", None)
+            if task:
+                state["task_id"] = task
+            m.save(self.state_args().state, state)
+            with patch.object(m, "api_call") as api, patch.object(m, "session") as session:
+                self.assertEqual(m.main_with_args(["resume", "--state", str(self.state_args().state)]), 1)
+            api.assert_not_called()
+            session.assert_not_called()
+
+    def test_bounded_wait_downloads_on_first_completion_without_post(self):
+        self.create()
+        ticks = iter([0, 0, 0, 10])
+        results = [{"status": "queued"}, {"status": "completed", "detail": {"data": [{"download_url": "https://cdn.example.com/out.png"}]}}]
+        output = self.args.out_dir / "image.png"
+        def downloaded(*args):
+            Image.new("RGB", (12, 12)).save(output)
+            return output, (12, 12)
+        with patch.object(m, "api_call", side_effect=results) as api, patch.object(m, "download", side_effect=downloaded), patch.object(m, "sleep") as sleep, patch.object(m, "monotonic", side_effect=lambda: next(ticks, 10)):
+            self.assertEqual(m.main_with_args(["status", "--state", str(self.state_args().state), "--wait", "40", "--interval", "10"]), 0)
+        self.assertTrue(output.exists())
+        self.assertEqual([c.args[0] for c in api.call_args_list], ["GET", "GET"])
+        sleep.assert_called_once_with(10)
+
+    def test_cached_completion_does_not_need_provider_or_key(self):
+        self.create()
+        output = self.args.out_dir / "image.png"
+        Image.new("RGB", (12, 12)).save(output)
+        state = json.loads(self.state_args().state.read_text())
+        state.update(phase="completed", output="image.png", size=[12, 12])
+        m.save(self.state_args().state, state)
+        with patch.object(m, "api_call", side_effect=AssertionError("No network for saved result")), patch.object(m, "get_key", side_effect=AssertionError("No key needed")):
+            m.status(self.state_args())
+
+    def test_resume_lock_prevents_concurrent_paid_submission(self):
+        self.args.out_dir.mkdir()
+        m.save(self.state_args().state, {"phase": "reference_uploading", "model": "gpt-image-2.5", "uploads": []})
+        (self.args.out_dir / "prompt.txt").write_text("test prompt")
+        (self.args.out_dir / "resume.lock").write_text("active")
+        m.private_file(self.args.out_dir / "resume.json", json.dumps({"images": [], "sha256": [], "cached": {}, "quality": "high"}))
+        with patch.object(m, "api_call") as api:
+            self.assertEqual(m.main_with_args(["resume", "--state", str(self.state_args().state)]), 1)
+        api.assert_not_called()
+
+    def test_wait_stops_at_deadline_retains_task_and_never_resubmits(self):
+        self.create()
+        now = [0]
+        def advance(seconds):
+            now[0] += seconds
+        with patch.object(m, "api_call", return_value={"status": "queued"}) as api, patch.object(m, "monotonic", side_effect=lambda: now[0]), patch.object(m, "sleep", side_effect=advance):
+            self.assertEqual(m.main_with_args(["status", "--state", str(self.state_args().state), "--wait", "25", "--interval", "10"]), 0)
+        self.assertEqual(now[0], 25)
+        self.assertTrue(all(c.args[0] == "GET" for c in api.call_args_list))
+        self.assertEqual(json.loads(self.state_args().state.read_text())["task_id"], "task_test")
+
+    def test_wait_stops_immediately_on_failed_task(self):
+        self.create()
+        with patch.object(m, "api_call", return_value={"status": "failed"}) as api, patch.object(m, "sleep") as sleep:
+            self.assertEqual(m.main_with_args(["status", "--state", str(self.state_args().state), "--wait", "40"]), 0)
+        self.assertEqual(api.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_preview_links_cannot_send_reference_to_other_hosts_or_files(self):
+        image = self.root / "ref.png"
+        Image.new("RGB", (8, 8)).save(image)
+        for link in ("https://evil.example/dl/token/ref.png", "https://tmpfiles.org/dl/123/token/other.png", "https://tmpfiles.org/dl/123/other/ref.png", "https://tmpfiles.org.evil.example/dl/token/ref.png"):
+            with self.subTest(link=link):
+                client = MagicMock()
+                client.get.return_value = self.response(('<a href="'+link+'">Download</a>').encode(), "text/html")
+                with self.assertRaises(m.UserError):
+                    m.verify_tmpfiles(client, "https://tmpfiles.org/token/ref.png", image)
+                self.assertEqual(client.get.call_count, 1)
+
+    def test_active_submission_also_blocks_resume_and_another_submit(self):
+        self.args.out_dir.mkdir()
+        (self.args.out_dir / "resume.lock").write_text("active submit")
+        with patch.object(m, "api_call") as api:
+            with self.assertRaises(m.UserError):
+                m.submit(self.args)
+        api.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()

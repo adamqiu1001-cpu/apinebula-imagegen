@@ -43,17 +43,22 @@ description: Use when the user selects APINebula to generate or edit images, or 
    PYTHON SCRIPT submit --prompt-file "edit.txt" --out-dir "outputs/photo-edit" --image "reference.png"
    ```
 
-   可加 `--quality low|medium|high|auto`。继续任务与显式参考图参数不能混用。首次请求沿用系统代理；只有诊断支持时才加 `--direct`，不改全局代理或 TLS 校验。
-3. 保存任务编号，每隔约 15–30 秒查询同一个状态文件：
+   可加 `--quality low|medium|high|auto`（默认 high）；用户明确要快速草稿时可用 medium，不保证服务端更快，不为提速自动生成两次。继续任务与显式参考图参数不能混用。首次请求沿用系统代理；只有诊断支持时才加 `--direct`，不改全局代理或 TLS 校验。
+3. 保存任务编号，优先用一次短时轮询查询同一个状态文件：
 
    ```text
-   PYTHON SCRIPT status --state "outputs/city-v2/state.json"
+   PYTHON SCRIPT status --state "outputs/city-v2/state.json" --wait 40 --interval 10
    ```
 
-   `queued`/`in_progress` 继续查同一任务，每次等待不超过 60 秒，并适时更新用户。`completed` 自动下载和验证格式。约 10 分钟仍未完成时保留任务，说明未完成，不承诺后台持续运行。
+   `--wait` 取 0–50 秒，`--interval` 取 5–30 秒；默认单次查询。每次先查状态，完成立即下载；到时仍为 `queued`/`in_progress` 则返回，更新用户后继续查同一任务，无须额外 sleep。已下载的 completed 结果从本机验证读取，不再请求服务端。网络调用本身另有超时。`completed` 自动下载和验证格式。约 10 分钟仍未完成时保留任务，说明未完成，不承诺后台持续运行。
 4. 实际查看返回图，确认修改内容、尺寸、格式；再用绝对路径内嵌图片并提供文件链接。报告模型标识和提示词文件。平台决定输出尺寸；需转换或缩放时另存，不覆盖原图。
 
 ## 恢复与清理
+
+- 临时图床兼容旧数字链接、新字母数字展示页和 `/dl/` 直链。脚本从展示页提取同一文件的 HTTPS 下载链接并校验原图字节，无须代理手动解析页面或重新上传。
+- 仅本地 tmpfiles 参考图、没有混合在线参考/父任务的提交，支持上传后中断恢复：`PYTHON SCRIPT resume --state "outputs/photo-edit/state.json"`。只有 `preparing`/`reference_uploading` 且无任务编号时允许；复用未到期的上传页，核验原图未变，沿用已保存提示词、模型和画质，最多发送一次生成请求。`submission_outcome_unknown` 或已有任务编号禁止 resume。
+- `resume.json` 是权限受限的临时恢复文件，含原图路径、哈希及临时展示页网址；不输出它，不当作交付文件。在付费请求前删除；需要时可提前手动删除以放弃恢复。`state.json` 不存临时网址或签名 URL。上传响应尚未保存就断网时无法复用；缓存过期时停止。S3、在线图或旧版无检查点任务保留原状态后诊断，不能通过换目录盲目重试。
+- `resume.lock` 防止同时恢复同一任务；进程异常退出留下锁时，确认无恢复进程运行且状态仍在提交前，才可删除锁。
 
 - 状态文件独占创建。结果未知、非 JSON、断网或缺少任务编号时保留目录，不通过换目录或删状态盲目重试付费提交。有任务编号则查询、下载可重试。
 - 任务 `failed` 时报告平台错误，不自动新建付费任务。不要无限重试或将请求成功当成出图成功。
